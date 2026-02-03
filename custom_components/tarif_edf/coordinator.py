@@ -1,16 +1,12 @@
 """Data update coordinator for the Tarif EDF integration."""
-
 from __future__ import annotations
-
 import asyncio
 import csv
 from datetime import timedelta, datetime, date
 import logging
 import re
 from typing import Any
-
 import aiohttp
-
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -85,6 +81,9 @@ class TarifEdfDataUpdateCoordinator(TimestampDataUpdateCoordinator):
         self.config_entry = entry
         self.tempo_prices: list[dict] = []
         self._session = async_get_clientsession(hass)
+        # Store the previous day's "demain" color for fallback
+        self._previous_demain_color: str | None = None
+        self._previous_demain_date: date | None = None
 
     async def _async_fetch_url(self, url: str, as_json: bool = False) -> bytes | dict:
         """Fetch URL content using the shared aiohttp session."""
@@ -249,6 +248,13 @@ class TarifEdfDataUpdateCoordinator(TimestampDataUpdateCoordinator):
 
         return result
 
+    def _get_color_code_from_name(self, color_name: str) -> int:
+        """Get tempo color code from name."""
+        for code, name in TEMPO_COLORS_MAPPING.items():
+            if name == color_name:
+                return code
+        return 0
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Get the latest data from Tarif EDF and updates the state."""
         data = self.config_entry.data
@@ -326,18 +332,54 @@ class TarifEdfDataUpdateCoordinator(TimestampDataUpdateCoordinator):
                 )
 
                 self.data["tempo_couleur_hier"] = yesterday_color
-                self.data["tempo_couleur_aujourdhui"] = today_color
                 self.data["tempo_couleur_demain"] = tomorrow_color
 
-                # Determine current color based on time of day
-                # Before 06:00, use yesterday's color
-                current_color_code = tempo_yesterday.get("codeJour", 0)
+                # FIX: Handle "indéterminé" for today's color by using previous day's "demain" value
+                # If today's color is unknown (codeJour = 0), check if we have a stored
+                # "demain" value from yesterday that corresponds to today
+                if today_color == "indéterminé":
+                    # Check if we have a valid fallback from the previous day's "demain"
+                    if (
+                        self._previous_demain_date == today_date
+                        and self._previous_demain_color is not None
+                        and self._previous_demain_color != "indéterminé"
+                    ):
+                        _LOGGER.debug(
+                            "Using previous day's 'demain' value (%s) for today's color",
+                            self._previous_demain_color
+                        )
+                        today_color = self._previous_demain_color
+                    # Also check if we have it stored in self.data from a previous run
+                    elif (
+                        self.data.get("_fallback_today_color") is not None
+                        and self.data.get("_fallback_today_date") == today_date.isoformat()
+                    ):
+                        _LOGGER.debug(
+                            "Using stored fallback value (%s) for today's color",
+                            self.data["_fallback_today_color"]
+                        )
+                        today_color = self.data["_fallback_today_color"]
 
+                self.data["tempo_couleur_aujourdhui"] = today_color
+
+                # Store tomorrow's color for use as fallback the next day
+                # Only store if it's a valid color (not "indéterminé")
+                if tomorrow_color != "indéterminé":
+                    self._previous_demain_color = tomorrow_color
+                    self._previous_demain_date = tomorrow
+                    # Also persist in data dict for survival across restarts
+                    self.data["_fallback_today_color"] = tomorrow_color
+                    self.data["_fallback_today_date"] = tomorrow.isoformat()
+
+                # Determine current color based on time of day
+                # Before 06:00, use yesterday's color; after 06:00, use today's color
                 if dt_util.now().time() >= str_to_time(TEMPO_DAY_START_AT):
                     _LOGGER.debug("Using today's tempo prices")
-                    current_color_code = tempo_today.get("codeJour", 0)
+                    # Use the already-resolved today_color (which includes fallback logic)
+                    current_color_code = self._get_color_code_from_name(today_color)
                 else:
                     _LOGGER.debug("Using yesterday's tempo prices")
+                    current_color_code = tempo_yesterday.get("codeJour", 0)
 
                 # Set current Tempo rates
                 if current_color_code in [1, 2, 3]:
@@ -373,6 +415,7 @@ class TarifEdfDataUpdateCoordinator(TimestampDataUpdateCoordinator):
         default_offpeak_hours = None
         if contract_type == CONTRACT_TYPE_TEMPO:
             default_offpeak_hours = TEMPO_OFFPEAK_HOURS
+
         off_peak_hours_ranges = self.config_entry.options.get(
             "off_peak_hours_ranges", default_offpeak_hours
         )
